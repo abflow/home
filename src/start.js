@@ -70,7 +70,8 @@ const result = await Promise.race([
   zigbee.exited.then((code) => ({ name: "Zigbee2MQTT", code })),
   broker.exited.then((code) => ({ name: "Mosquitto", code })),
 ]);
-if (!stopping) console.log(`${result.name} stopped (exit ${result.code}).`);
+const unexpected = !stopping;
+if (unexpected) console.log(`${result.name} stopped (exit ${result.code}).`);
 stop();
 await Promise.all([zigbee.exited, broker.exited]);
-if (!stopping && result.code !== 0) process.exitCode = result.code;
+if (unexpected && result.code !== 0) process.exitCode = result.code;

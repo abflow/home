@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "zigbee": "bun ./node_modules/zigbee2mqtt/index.js"
+    "zigbee": "Z2M_ONBOARD_URL=http://127.0.0.1:8081 bun ./node_modules/zigbee2mqtt/index.js"
   },
   "dependencies": {
     "zigbee2mqtt": "2.14.2"

@@ -1,0 +1,12 @@
+{
+  "name": "home",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "zigbee": "bun ./node_modules/zigbee2mqtt/index.js"
+  },
+  "dependencies": {
+    "zigbee2mqtt": "2.14.2"
+  }
+}

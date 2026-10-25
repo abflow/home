@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "zigbee": "bun ./node_modules/zigbee2mqtt/index.js writehash && Z2M_ONBOARD_URL=http://127.0.0.1:8081 bun ./node_modules/zigbee2mqtt/index.js"
+    "zigbee": "bun run zigbee:setup && bun ./node_modules/zigbee2mqtt/index.js writehash && ZIGBEE2MQTT_DATA=$PWD/data/zigbee2mqtt Z2M_ONBOARD_URL=http://127.0.0.1:8081 bun ./node_modules/zigbee2mqtt/index.js",
+    "zigbee:setup": "mkdir -p data/zigbee2mqtt && if [ ! -f data/zigbee2mqtt/configuration.yaml ]; then cp config/zigbee2mqtt.example.yaml data/zigbee2mqtt/configuration.yaml && chmod 600 data/zigbee2mqtt/configuration.yaml; fi"
   },
   "dependencies": {
     "zigbee2mqtt": "2.14.2"

@@ -135,12 +135,9 @@ try {
     client.once("error", reject);
   });
 
-  await new Promise((resolve, reject) => {
-    client.subscribe([`${base}/bridge/devices`, `${base}/+`, `${base}/#`], (err) => err ? reject(err) : resolve());
-  });
-
-  // The bridge/devices topic is retained, so a newly connected client receives it.
-  const devices = await new Promise((resolve) => {
+  // Install the listener before subscribing: retained messages can arrive
+  // before the SUBACK callback completes.
+  const devicesPromise = new Promise((resolve) => {
     const listener = (topic, data) => {
       if (topic !== `${base}/bridge/devices` || !Array.isArray(data)) return;
       clearTimeout(timer);
@@ -150,6 +147,10 @@ try {
     listeners.add(listener);
     const timer = setTimeout(() => { listeners.delete(listener); resolve(null); }, timeoutMs);
   });
+  await new Promise((resolve, reject) => {
+    client.subscribe(`${base}/#`, (err) => err ? reject(err) : resolve());
+  });
+  const devices = await devicesPromise;
   if (!devices) throw new Error("No bridge/devices message received. Is Zigbee2MQTT running?");
 
   const valves = devices.filter((device) =>

@@ -1,79 +1,95 @@
 /**
- * Snapshot of all SONOFF TRV-ZBT valves, including group 1 weekly schedules.
- *
+ * Read all SONOFF TRV-ZBT valves and group 1 weekly schedules via Zigbee2MQTT.
+ * Usage: bun tools/trv.js
  * Install once: bun add mqtt
- * Run:          bun tools/trv.js
- * Optional:     MQTT_URL=mqtt://127.0.0.1:1883 bun tools/trv.js
+ * Optional: TRV_TIMEOUT_MS=12000 MQTT_URL=mqtt://127.0.0.1:1883 bun tools/trv.js
  *
- * This tool temporarily selects schedule_group_to_edit=1 (if needed), then
- * restores its original value. It never changes schedule_active_group or
- * the heating setpoint/schedules.
+ * Queries are batched; at most two TRVs are processed concurrently.
+ * Only schedule_group_to_edit may be temporarily changed; it is restored.
  */
 import mqtt from "mqtt";
 
 const base = process.env.Z2M_BASE_TOPIC ?? "zigbee2mqtt";
+const timeout = Number(process.env.TRV_TIMEOUT_MS ?? 12000);
+const maxConcurrent = 2;
+const days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+const scheduleFields = days.map(day => `weekly_schedule_${day}`);
+const overviewFields = [
+  "occupied_heating_setpoint", "local_temperature", "system_mode",
+  "schedule_active_group", "schedule_group_to_edit",
+];
+if (!Number.isFinite(timeout) || timeout < 1000) throw new Error("Invalid TRV_TIMEOUT_MS");
+
 const client = mqtt.connect(process.env.MQTT_URL ?? "mqtt://127.0.0.1:1883", {
   reconnectPeriod: 0,
   connectTimeout: 5000,
 });
-const days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
-const fields = [
-  "occupied_heating_setpoint",
-  "local_temperature",
-  "system_mode",
-  "schedule_active_group",
-  "schedule_group_to_edit",
-  ...days.map((day) => `weekly_schedule_${day}`),
-];
-const timeoutMs = Number(process.env.TRV_TIMEOUT_MS ?? 5000);
-const pauseMs = Number(process.env.TRV_PAUSE_MS ?? 200);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const listeners = new Set();
-let closed = false;
+const watchers = new Set();
+client.on("message", (topic, payload, packet) => {
+  let state;
+  try { state = JSON.parse(payload.toString()); } catch { return; }
+  for (const watcher of watchers) watcher(topic, state, packet);
+});
 
-function onMessage(topic, payload, packet) {
-  let data;
-  try { data = JSON.parse(payload.toString()); } catch { return; }
-  for (const callback of listeners) callback(topic, data, packet);
+async function subscribe(topic) {
+  return new Promise((resolve, reject) =>
+    client.subscribe(topic, (error) => error ? reject(error) : resolve()));
 }
-client.on("message", onMessage);
-
-function waitFor(topic, check = () => true, timeout = timeoutMs) {
-  return new Promise((resolve) => {
-    const listener = (messageTopic, data, packet) => {
-      if (messageTopic !== topic || packet.retain || !check(data)) return;
+async function publish(topic, value) {
+  return new Promise((resolve, reject) =>
+    client.publish(topic, JSON.stringify(value), (error) => error ? reject(error) : resolve()));
+}
+function until(topic, condition, ms = timeout, acceptRetained = false) {
+  let timer;
+  let listener;
+  const promise = new Promise((resolve) => {
+    listener = (incoming, data, packet) => {
+      if (incoming !== topic || (!acceptRetained && packet.retain) || !condition(data)) return;
       cleanup();
       resolve(data);
     };
-    const timer = setTimeout(() => { cleanup(); resolve(null); }, timeout);
-    function cleanup() { clearTimeout(timer); listeners.delete(listener); }
-    listeners.add(listener);
+    timer = setTimeout(() => { cleanup(); resolve(null); }, ms);
+    watchers.add(listener);
   });
+  function cleanup() { clearTimeout(timer); watchers.delete(listener); }
+  return { promise, cancel: cleanup };
 }
-
-function publish(topic, data) {
-  return new Promise((resolve, reject) =>
-    client.publish(topic, JSON.stringify(data), (error) => error ? reject(error) : resolve())
-  );
+async function request(name, keys) {
+  const topic = `${base}/${name}`;
+  const values = {};
+  const needed = new Set(keys);
+  const watcher = until(topic, (data) => {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    for (const key of [...needed]) {
+      if (data[key] !== undefined && data[key] !== null) {
+        values[key] = data[key];
+        needed.delete(key);
+      }
+    }
+    return needed.size === 0;
+  });
+  try {
+    await publish(`${topic}/get`, Object.fromEntries(keys.map(key => [key, ""])));
+    await watcher.promise;
+  } finally {
+    watcher.cancel();
+  }
+  return { values, missing: [...needed] };
 }
-
-async function read(device, key) {
-  const topic = `${base}/${device}`;
-  const answer = waitFor(topic, (data) => data && Object.hasOwn(data, key));
-  await publish(`${topic}/get`, { [key]: "" });
-  return (await answer)?.[key] ?? null;
+async function selectGroup(name, group) {
+  const watcher = until(`${base}/${name}`,
+    (data) => String(data?.schedule_group_to_edit) === String(group));
+  try {
+    await publish(`${base}/${name}/set`, { schedule_group_to_edit: String(group) });
+    return (await watcher.promise) !== null;
+  } finally {
+    watcher.cancel();
+  }
 }
-
-async function writeAndConfirm(device, key, value) {
-  const topic = `${base}/${device}`;
-  const answer = waitFor(topic, (data) => data && String(data[key]) === String(value));
-  await publish(`${topic}/set`, { [key]: value });
-  return (await answer) !== null;
-}
-
 async function inspect(device) {
+  const name = device.friendly_name;
   const result = {
-    name: device.friendly_name,
+    name,
     ieee_address: device.ieee_address,
     model: device.definition?.model ?? device.model_id,
     occupied_heating_setpoint: null,
@@ -82,94 +98,80 @@ async function inspect(device) {
     schedule_active_group: null,
     schedule_group_to_edit_before: null,
     weekly_schedule_group: 1,
-    weekly_schedule: Object.fromEntries(days.map((day) => [day, null])),
+    weekly_schedule: Object.fromEntries(days.map(day => [day, null])),
     warnings: [],
   };
-
-  const name = device.friendly_name;
-  for (const key of fields.slice(0, 5)) {
-    const value = await read(name, key);
-    if (key === "schedule_group_to_edit") result.schedule_group_to_edit_before = value;
-    else result[key] = value;
-    if (value === null) result.warnings.push(`No response: ${key}`);
-    await sleep(pauseMs);
-  }
-
-  const original = result.schedule_group_to_edit_before;
-  let groupOneSelected = String(original) === "1";
-  let changed = false;
-  if (original !== null && !groupOneSelected) {
-    groupOneSelected = await writeAndConfirm(name, "schedule_group_to_edit", "1");
-    changed = groupOneSelected;
-    if (!groupOneSelected) result.warnings.push("Could not select schedule group 1");
-    await sleep(pauseMs);
-  }
-  if (original === null) {
-    result.warnings.push("Unknown schedule_group_to_edit; schedules not read to avoid attributing the wrong group");
-  }
-
   try {
-    if (groupOneSelected) {
-      for (const day of days) {
-        const key = `weekly_schedule_${day}`;
-        result.weekly_schedule[day] = await read(name, key);
-        if (result.weekly_schedule[day] === null) result.warnings.push(`No response: ${key}`);
-        await sleep(pauseMs);
+    const overview = await request(name, overviewFields);
+    for (const key of overviewFields) {
+      if (key === "schedule_group_to_edit") result.schedule_group_to_edit_before = overview.values[key] ?? null;
+      else result[key] = overview.values[key] ?? null;
+    }
+    if (overview.missing.length) result.warnings.push(`Missing overview: ${overview.missing.join(", ")}`);
+
+    const previous = result.schedule_group_to_edit_before;
+    let selected = String(previous) === "1";
+    let changed = false;
+    if (previous !== null && !selected) {
+      selected = await selectGroup(name, "1");
+      changed = selected;
+      if (!selected) result.warnings.push("Could not select schedule group 1");
+    } else if (previous === null) {
+      result.warnings.push("Unknown group to edit; schedules skipped to avoid wrong attribution");
+    }
+    try {
+      if (selected) {
+        const schedules = await request(name, scheduleFields);
+        for (const day of days) result.weekly_schedule[day] =
+          schedules.values[`weekly_schedule_${day}`] ?? null;
+        if (schedules.missing.length)
+          result.warnings.push(`Missing schedules: ${schedules.missing.join(", ")}`);
+      }
+    } finally {
+      if (changed && !(await selectGroup(name, previous))) {
+        result.warnings.push(`WARNING: could not confirm restoration of schedule_group_to_edit=${previous}`);
       }
     }
-  } finally {
-    if (changed) {
-      const restored = await writeAndConfirm(name, "schedule_group_to_edit", original);
-      if (!restored) result.warnings.push(`Could not confirm restoration of schedule_group_to_edit=${original}`);
-    }
+  } catch (error) {
+    result.warnings.push(error instanceof Error ? error.message : String(error));
   }
   return result;
 }
-
 try {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isFinite(pauseMs) || pauseMs < 0)
-    throw new Error("Invalid TRV_TIMEOUT_MS or TRV_PAUSE_MS");
-
   await new Promise((resolve, reject) => {
     client.once("connect", resolve);
     client.once("error", reject);
   });
-
-  // Install the listener before subscribing: retained messages can arrive
-  // before the SUBACK callback completes.
-  const devicesPromise = new Promise((resolve) => {
-    const listener = (topic, data) => {
-      if (topic !== `${base}/bridge/devices` || !Array.isArray(data)) return;
-      clearTimeout(timer);
-      listeners.delete(listener);
-      resolve(data);
-    };
-    listeners.add(listener);
-    const timer = setTimeout(() => { listeners.delete(listener); resolve(null); }, timeoutMs);
-  });
-  await new Promise((resolve, reject) => {
-    client.subscribe(`${base}/#`, (err) => err ? reject(err) : resolve());
-  });
-  const devices = await devicesPromise;
-  if (!devices) throw new Error("No bridge/devices message received. Is Zigbee2MQTT running?");
-
-  const valves = devices.filter((device) =>
-    device.type !== "Coordinator" && device.supported !== false && device.disabled !== true &&
-    (device.definition?.model === "TRV-ZBT" || device.model_id === "TRV-ZBT")
-  );
-  const output = [];
-  for (const device of valves) {
-    output.push(await inspect(device));
+  // Listen before subscribing, so retained bridge/devices cannot be missed.
+  const list = until(`${base}/bridge/devices`, Array.isArray, timeout, true);
+  try {
+    await subscribe(`${base}/#`);
+    const devices = await list.promise;
+    if (!devices) throw new Error("No bridge/devices response from Zigbee2MQTT");
+    const valves = devices.filter(d =>
+      d.type !== "Coordinator" && d.disabled !== true && d.supported !== false &&
+      (d.definition?.model === "TRV-ZBT" || d.model_id === "TRV-ZBT")
+    );
+    const results = new Array(valves.length);
+    let next = 0;
+    async function worker() {
+      while (next < valves.length) {
+        const index = next++;
+        results[index] = await inspect(valves[index]);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(maxConcurrent, valves.length) }, worker));
+    console.log(JSON.stringify({
+      captured_at: new Date().toISOString(),
+      device_count: results.length,
+      devices: results,
+    }, null, 2));
+  } finally {
+    list.cancel();
   }
-
-  console.log(JSON.stringify({
-    captured_at: new Date().toISOString(),
-    device_count: output.length,
-    devices: output,
-  }, null, 2));
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
 } finally {
-  if (!closed) { closed = true; client.end(true); }
+  client.end(true);
 }
